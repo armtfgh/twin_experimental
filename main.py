@@ -466,6 +466,12 @@ class DigitalTwin:
         """Return brand new reservoirs based on the templates."""
         return self._clone_map(self._reservoir_templates)
 
+    def new_pipette(self) -> Pipette:
+        return Pipette(**self._pipette_config)
+
+    def new_vial(self) -> Vial:
+        return Vial(capacity_mL=self._vial_capacity_mL, position_cm=self._vial_position_cm)
+
     def run(self, recipe: Sequence[Tuple[str, float]], seed: int = 7) -> RunResult:
         """Execute a recipe and return the timeline/event log."""
         random.seed(seed)
@@ -486,6 +492,136 @@ class DigitalTwin:
             pipette_start_pos=pipette_start,
             recipe=[(name, vol) for name, vol in recipe],
             seed=seed,
+        )
+
+
+class ManualSession:
+    """Step-by-step controller for manual operation."""
+
+    def __init__(self, twin: DigitalTwin, seed: int = 7) -> None:
+        self.twin = twin
+        self.seed = seed
+        random.seed(seed)
+        self.reservoirs = twin.new_reservoirs()
+        self.initial_reservoirs = twin._clone_map(self.reservoirs)
+        self.vial = twin.new_vial()
+        self.pipette = twin.new_pipette()
+        self.sim = Simulation()
+        self.pipette_start_pos = self.pipette.position_cm
+        self.current_target: str | None = None
+        self.commands: List[str] = []
+        self.default_volume = 0.10
+        self._positions: Dict[str, Tuple[float, float]] = {
+            name: res.position_cm for name, res in self.reservoirs.items()
+        }
+        self._positions["Vial"] = self.vial.position_cm
+
+    def available_targets(self) -> List[str]:
+        return list(self._positions.keys())
+
+    def _resolve_target(self, name: str) -> str | None:
+        lookup = name.strip().lower()
+        for target in self._positions:
+            if target.lower() == lookup:
+                return target
+        return None
+
+    def move(self, target_name: str) -> Tuple[bool, str]:
+        resolved = self._resolve_target(target_name)
+        if not resolved:
+            return False, f"Unknown target '{target_name}'. Options: {', '.join(self.available_targets())}"
+        start = self.pipette.position_cm
+        move_time, distance = self.pipette.move_to(self._positions[resolved])
+        self.sim.advance(move_time)
+        self.sim.record(
+            "MOVE",
+            resolved,
+            note=f"{distance:.1f} cm hop",
+            duration=move_time,
+            start_pos=start,
+            end_pos=self.pipette.position_cm,
+        )
+        self.current_target = resolved
+        return True, f"Moved to {resolved} ({distance:.1f} cm)."
+
+    def aspirate(self, volume_mL: float | None = None) -> Tuple[bool, str]:
+        volume = self.default_volume if volume_mL is None else max(0.0, volume_mL)
+        if self.current_target is None or self.current_target not in self.reservoirs:
+            return False, "Move to a reservoir before aspirating."
+        reservoir = self.reservoirs[self.current_target]
+        actual, duration, note = self.pipette.aspirate(reservoir, volume)
+        if actual <= 0:
+            return False, note
+        self.sim.advance(duration)
+        self.sim.record(
+            "ASPIRATE",
+            reservoir.name,
+            volume=actual,
+            note=note,
+            duration=duration,
+            start_pos=self.pipette.position_cm,
+            end_pos=self.pipette.position_cm,
+        )
+        return True, f"Aspirated {actual:.3f} mL from {reservoir.name} ({note})."
+
+    def dispense(self) -> Tuple[bool, str]:
+        if self.current_target != "Vial":
+            return False, "Move to the Vial before dispensing."
+        delivered, duration, note = self.pipette.dispense(self.vial)
+        if delivered <= 0:
+            return False, note
+        self.sim.advance(duration)
+        color = self.vial.color()
+        self.sim.record(
+            "DISPENSE",
+            "Vial",
+            volume=delivered,
+            note=f"{note}; mix {color.hex_value}",
+            duration=duration,
+            start_pos=self.pipette.position_cm,
+            end_pos=self.pipette.position_cm,
+            color_hex=color.hex_value,
+        )
+        return True, f"Dispensed {delivered:.3f} mL into vial ({note})."
+
+    def status_summary(self) -> str:
+        pipette_vol = self.pipette.current_volume()
+        capacity = self.pipette.max_volume_mL
+        contents = ", ".join(
+            f"{p.source}:{p.volume_mL:.2f}" for p in self.pipette.contents
+        ) or "empty"
+        info = [
+            f"Pipette: {pipette_vol:.3f}/{capacity:.3f} mL ({contents})",
+            f"Vial: {self.vial.current_volume():.3f}/{self.vial.capacity_mL:.3f} mL, color {self.vial.color().hex_value}",
+            "Reservoirs: "
+            + ", ".join(f"{name} {res.volume_mL:.1f} mL" for name, res in self.reservoirs.items()),
+        ]
+        if self.current_target:
+            info.append(f"Current position: {self.current_target}")
+        info.append(f"Default aspirate volume: {self.default_volume:.2f} mL")
+        return "\n".join(info)
+
+    def log_tail(self, count: int = 8) -> List[str]:
+        return [
+            f"{evt.action:<9} {evt.target:<8} {evt.note}"
+            for evt in self.sim.events[-count:]
+        ]
+
+    def set_default_volume(self, volume: float) -> None:
+        self.default_volume = clamp(volume, 0.0, self.pipette.max_volume_mL)
+
+    def append_command(self, command: str) -> None:
+        self.commands.append(command)
+
+    def finish(self) -> RunResult:
+        return RunResult(
+            events=list(self.sim.events),
+            vial=self.vial,
+            final_reservoirs=self.twin._clone_map(self.reservoirs, use_current_volume=True),
+            initial_reservoirs=self.initial_reservoirs,
+            pipette_start_pos=self.pipette_start_pos,
+            recipe=[(cmd, 0.0) for cmd in self.commands],
+            seed=self.seed,
         )
 
 
@@ -510,6 +646,312 @@ def print_summary(vial: Vial) -> None:
     print("  Composition:")
     for name, volume in vial.composition().items():
         print(f"    - {name:<7} {volume:.2f} mL")
+
+
+def manual_text_loop(session: ManualSession) -> RunResult:
+    print(
+        "\nManual mode commands:\n"
+        "  move <target>|m   - Move pipette to a reservoir or 'vial'\n"
+        "  aspirate [vol]|a  - Aspirate volume in mL (defaults to current preset)\n"
+        "  dispense|d        - Dispense into the vial\n"
+        "  volume <val>|v    - Set default aspirate volume in mL\n"
+        "  status|s          - Show pipette, vial, and reservoir state\n"
+        "  log|l             - Show recent event log\n"
+        "  help|h            - Show this help again\n"
+        "  quit|exit|q       - Finish manual session\n"
+    )
+    print(f"Targets: {', '.join(session.available_targets())}")
+    while True:
+        try:
+            raw = input("manual> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[info] Manual session interrupted by user.")
+            break
+        if not raw:
+            continue
+        lowered = raw.lower()
+        if lowered in {"quit", "exit", "q"}:
+            break
+        parts = raw.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        def respond(success: bool, message: str) -> None:
+            icon = "✅" if success else "⚠️"
+            print(f"{icon} {message}")
+
+        if cmd in {"move", "m"}:
+            if not args:
+                respond(False, "Specify a target, e.g., 'move Crimson'")
+                continue
+            session.append_command(raw)
+            ok, msg = session.move(" ".join(args))
+            respond(ok, msg)
+        elif cmd in {"aspirate", "a"}:
+            volume = None
+            if args:
+                try:
+                    volume = float(args[0])
+                except ValueError:
+                    respond(False, f"Invalid volume '{args[0]}'.")
+                    continue
+            session.append_command(raw)
+            ok, msg = session.aspirate(volume)
+            respond(ok, msg)
+        elif cmd in {"dispense", "d"}:
+            session.append_command(raw)
+            ok, msg = session.dispense()
+            respond(ok, msg)
+        elif cmd in {"volume", "v"}:
+            if not args:
+                print(f"Current default volume: {session.default_volume:.2f} mL")
+                continue
+            try:
+                value = float(args[0])
+            except ValueError:
+                respond(False, f"Invalid number '{args[0]}'.")
+                continue
+            session.set_default_volume(value)
+            print(f"Default aspirate volume set to {session.default_volume:.2f} mL.")
+        elif cmd in {"status", "s"}:
+            print(session.status_summary())
+        elif cmd in {"log", "l"}:
+            tail = session.log_tail()
+            print("Recent events:")
+            for line in tail or ["<none>"]:
+                print("  ", line)
+        elif cmd in {"help", "h"}:
+            print(
+                "Commands: move/m, aspirate/a, dispense/d, volume/v, status/s, log/l, help/h, quit/q"
+            )
+        else:
+            respond(False, f"Unknown command '{cmd}'. Type 'help' for options.")
+
+    print("[info] Manual session finished.")
+    return session.finish()
+
+
+def manual_pygame_loop(session: ManualSession) -> RunResult:
+    try:
+        import pygame
+    except ImportError:
+        print("PyGame is not installed. Falling back to text-based manual mode.")
+        return manual_text_loop(session)
+
+    try:
+        pygame.init()
+        screen = pygame.display.set_mode((1000, 640))
+        pygame.display.set_caption("Manual Control — Digital Twin")
+    except pygame.error as exc:
+        print(
+            "PyGame could not open a window (missing display?). "
+            f"Falling back to manual text mode. Details: {exc}"
+        )
+        return manual_text_loop(session)
+
+    font = pygame.font.SysFont("Arial", 18)
+    small_font = pygame.font.SysFont("Arial", 14)
+    clock = pygame.time.Clock()
+    scale = 55.0
+    origin = (180.0, 70.0)
+
+    def world_to_screen(pos: Tuple[float, float]) -> Tuple[int, int]:
+        return (
+            int(origin[0] + pos[0] * scale),
+            int(origin[1] + pos[1] * scale),
+        )
+
+    target_order = list(session.reservoirs.keys()) + ["Vial"]
+    key_codes = [
+        pygame.K_1,
+        pygame.K_2,
+        pygame.K_3,
+        pygame.K_4,
+        pygame.K_5,
+        pygame.K_6,
+        pygame.K_7,
+        pygame.K_8,
+        pygame.K_9,
+    ]
+    target_key_map = {
+        key_codes[idx]: target
+        for idx, target in enumerate(target_order)
+        if idx < len(key_codes)
+    }
+
+    messages: List[Tuple[bool, str]] = []
+
+    def push_message(success: bool, text: str) -> None:
+        messages.append((success, text))
+        if len(messages) > 6:
+            messages.pop(0)
+
+    def draw_reservoirs() -> None:
+        for name, reservoir in session.reservoirs.items():
+            center = world_to_screen(reservoir.position_cm)
+            rect = pygame.Rect(center[0] - 35, center[1] - 50, 70, 100)
+            pygame.draw.rect(screen, (50, 52, 60), rect, 2, border_radius=6)
+            level_frac = (
+                reservoir.volume_mL / reservoir.initial_volume_mL
+                if reservoir.initial_volume_mL > 0
+                else 0.0
+            )
+            level_frac = clamp(level_frac, 0.0, 1.0)
+            fill_height = int((rect.height - 6) * level_frac)
+            fill_rect = pygame.Rect(
+                rect.left + 3,
+                rect.bottom - 3 - fill_height,
+                rect.width - 6,
+                fill_height,
+            )
+            pygame.draw.rect(screen, approx_reservoir_color(reservoir.absorption), fill_rect, border_radius=4)
+            label = font.render(name, True, (220, 220, 230))
+            screen.blit(label, (rect.centerx - label.get_width() // 2, rect.top - 24))
+            screen.blit(
+                small_font.render(f"{reservoir.volume_mL:.1f} mL", True, (200, 200, 210)),
+                (rect.centerx - 34, rect.bottom + 6),
+            )
+
+    def draw_vial() -> None:
+        center = world_to_screen(session.vial.position_cm)
+        rect = pygame.Rect(center[0] - 40, center[1] - 65, 80, 130)
+        pygame.draw.rect(screen, (70, 70, 80), rect, 2, border_radius=8)
+        fill_frac = clamp(
+            session.vial.current_volume() / session.vial.capacity_mL
+            if session.vial.capacity_mL
+            else 0.0,
+            0.0,
+            1.0,
+        )
+        fill_height = int((rect.height - 6) * fill_frac)
+        fill_rect = pygame.Rect(
+            rect.left + 3,
+            rect.bottom - 3 - fill_height,
+            rect.width - 6,
+            fill_height,
+        )
+        pygame.draw.rect(
+            screen,
+            hex_to_rgb(session.vial.color().hex_value),
+            fill_rect,
+            border_radius=6,
+        )
+        label = font.render("Vial", True, (220, 220, 230))
+        screen.blit(label, (rect.centerx - label.get_width() // 2, rect.top - 28))
+        screen.blit(
+            small_font.render(
+                f"{session.vial.current_volume():.2f}/{session.vial.capacity_mL:.2f} mL",
+                True,
+                (200, 200, 210),
+            ),
+            (rect.left, rect.bottom + 6),
+        )
+
+    def draw_pipette() -> None:
+        pos = world_to_screen(session.pipette.position_cm)
+        pygame.draw.circle(screen, (240, 240, 240), pos, 12)
+        pygame.draw.circle(screen, (100, 180, 255), pos, 12, 2)
+
+    def draw_messages() -> None:
+        area = pygame.Rect(620, 40, 340, 200)
+        pygame.draw.rect(screen, (20, 22, 30), area, border_radius=8)
+        pygame.draw.rect(screen, (60, 62, 70), area, 2, border_radius=8)
+        title = font.render("Messages", True, (230, 230, 230))
+        screen.blit(title, (area.left + 12, area.top + 8))
+        for idx, (success, text) in enumerate(messages[-6:]):
+            color = (140, 220, 160) if success else (240, 190, 100)
+            screen.blit(
+                small_font.render(text, True, color),
+                (area.left + 12, area.top + 36 + idx * 20),
+            )
+
+    def draw_log_tail() -> None:
+        area = pygame.Rect(620, 260, 340, 170)
+        pygame.draw.rect(screen, (20, 22, 30), area, border_radius=8)
+        pygame.draw.rect(screen, (60, 62, 70), area, 2, border_radius=8)
+        title = font.render("Event Log", True, (230, 230, 230))
+        screen.blit(title, (area.left + 12, area.top + 8))
+        tail = session.log_tail()
+        for idx, line in enumerate(reversed(tail[-7:])):
+            screen.blit(
+                small_font.render(line, True, (200, 200, 210)),
+                (area.left + 12, area.top + 36 + idx * 18),
+            )
+
+    def draw_status_bar() -> None:
+        area = pygame.Rect(20, 560, 940, 60)
+        pygame.draw.rect(screen, (20, 22, 30), area, border_radius=8)
+        pygame.draw.rect(screen, (60, 62, 70), area, 2, border_radius=8)
+        info = (
+            f"Pipette {session.pipette.current_volume():.2f}/{session.pipette.max_volume_mL:.2f} mL  |  "
+            f"Default vol {session.default_volume:.2f} mL  |  "
+            f"Current target: {session.current_target or 'None'}"
+        )
+        screen.blit(small_font.render(info, True, (220, 220, 230)), (area.left + 12, area.top + 10))
+        instructions = (
+            "Controls: 1-n move, A aspirate, D/Space dispense, +/- adjust vol, L log, TAB status, ESC quit"
+        )
+        screen.blit(small_font.render(instructions, True, (200, 200, 210)), (area.left + 12, area.top + 32))
+
+    def push_status_summary() -> None:
+        for line in session.status_summary().splitlines():
+            push_message(True, line)
+
+    def push_log_tail() -> None:
+        tail = session.log_tail()
+        if not tail:
+            push_message(True, "<no events yet>")
+        else:
+            for line in tail[-4:]:
+                push_message(True, line)
+
+    push_message(True, "Manual PyGame control ready. Use number keys to move.")
+
+    running = True
+    while running:
+        dt = clock.tick(60) / 1000.0  # noqa: F841
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key in target_key_map:
+                    target = target_key_map[event.key]
+                    session.append_command(f"move {target} [key]")
+                    ok, msg = session.move(target)
+                    push_message(ok, msg)
+                elif event.key == pygame.K_a:
+                    session.append_command("aspirate [key]")
+                    ok, msg = session.aspirate()
+                    push_message(ok, msg)
+                elif event.key in (pygame.K_d, pygame.K_SPACE):
+                    session.append_command("dispense [key]")
+                    ok, msg = session.dispense()
+                    push_message(ok, msg)
+                elif event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
+                    session.set_default_volume(session.default_volume - 0.01)
+                    push_message(True, f"Default volume {session.default_volume:.2f} mL")
+                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                    session.set_default_volume(session.default_volume + 0.01)
+                    push_message(True, f"Default volume {session.default_volume:.2f} mL")
+                elif event.key == pygame.K_TAB:
+                    push_status_summary()
+                elif event.key == pygame.K_l:
+                    push_log_tail()
+
+        screen.fill((12, 13, 18))
+        draw_reservoirs()
+        draw_vial()
+        draw_pipette()
+        draw_messages()
+        draw_log_tail()
+        draw_status_bar()
+        pygame.display.flip()
+
+    pygame.quit()
+    print("[info] Manual PyGame session finished.")
+    return session.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +980,8 @@ def visualize_with_pygame(
     reservoirs: Dict[str, Reservoir],
     vial_capacity: float,
     pipette_start_pos: Tuple[float, float],
+    target_hex: str | None = None,
+    wait_for_continue: bool = False,
 ) -> None:
     try:
         import pygame
@@ -587,7 +1031,8 @@ def visualize_with_pygame(
     current_event_index = 0
     event_progress = 0.0
     log_lines: List[str] = []
-    done = False
+    timeline_done = False
+    target_hex_display = target_hex.upper() if target_hex else None
 
     def draw_reservoirs() -> None:
         for name, data in reservoir_levels.items():
@@ -642,13 +1087,30 @@ def visualize_with_pygame(
         for idx, line in enumerate(reversed(log_lines[-8:])):
             draw_text(screen, line, (area.left + 12, area.top + 36 + idx * 20))
 
-    def draw_mix_chip() -> None:
-        chip_rect = pygame.Rect(620, 320, 340, 140)
-        pygame.draw.rect(screen, (24, 26, 34), chip_rect, border_radius=8)
-        pygame.draw.rect(screen, (60, 62, 70), chip_rect, 2, border_radius=8)
-        inner = chip_rect.inflate(-16, -50)
-        pygame.draw.rect(screen, hex_to_rgb(vial_color_hex), inner, border_radius=12)
-        draw_text(screen, f"Current mix: {vial_color_hex}", (chip_rect.left + 16, chip_rect.bottom - 36))
+    def draw_color_panel() -> None:
+        panel_height = 220 if target_hex_display else 150
+        panel_rect = pygame.Rect(620, 320, 340, panel_height)
+        pygame.draw.rect(screen, (24, 26, 34), panel_rect, border_radius=8)
+        pygame.draw.rect(screen, (60, 62, 70), panel_rect, 2, border_radius=8)
+
+        current_rect = pygame.Rect(panel_rect.left + 16, panel_rect.top + 40, panel_rect.width - 32, 70)
+        pygame.draw.rect(screen, hex_to_rgb(vial_color_hex), current_rect, border_radius=12)
+        draw_text(screen, "Current mix", (panel_rect.left + 16, panel_rect.top + 14))
+        draw_text(
+            screen,
+            f"{vial_volume:.2f} mL  {vial_color_hex}",
+            (panel_rect.left + 16, current_rect.bottom + 6),
+        )
+
+        if target_hex_display:
+            target_rect = pygame.Rect(panel_rect.left + 16, current_rect.bottom + 36, panel_rect.width - 32, 60)
+            pygame.draw.rect(screen, hex_to_rgb(target_hex_display), target_rect, border_radius=12)
+            draw_text(screen, "Target mix", (panel_rect.left + 16, target_rect.top - 24))
+            draw_text(
+                screen,
+                target_hex_display,
+                (panel_rect.left + 16, target_rect.bottom + 4),
+            )
 
     while True:
         for event in pygame.event.get():
@@ -659,11 +1121,14 @@ def visualize_with_pygame(
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     pygame.quit()
                     return
+                if wait_for_continue and timeline_done and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    pygame.quit()
+                    return
 
         dt = clock.tick(60) / 1000.0
         screen.fill((12, 13, 18))
 
-        if not done and current_event_index < len(events):
+        if not timeline_done and current_event_index < len(events):
             evt = events[current_event_index]
             duration = evt.duration_s if evt.duration_s > 0 else 0.4
             event_progress += dt
@@ -691,15 +1156,15 @@ def visualize_with_pygame(
                 log_lines.append(f"{evt.action:<9} {evt.target:<8} {evt.note}")
                 current_event_index += 1
                 if current_event_index >= len(events):
-                    done = True
+                    timeline_done = True
         else:
-            done = True
+            timeline_done = True
 
         draw_reservoirs()
         draw_vial()
         draw_pipette()
         draw_log()
-        draw_mix_chip()
+        draw_color_panel()
 
         status_text = (
             f"Event {min(current_event_index + 1, len(events))}/{len(events)}"
@@ -707,22 +1172,50 @@ def visualize_with_pygame(
             else "No events"
         )
         draw_text(screen, status_text, (20, 20))
-        draw_text(screen, "Press ESC to exit", (20, 40))
+        if wait_for_continue and timeline_done:
+            draw_text(screen, "Timeline done. Press ENTER to continue or ESC to exit.", (20, 40))
+        else:
+            draw_text(screen, "Press ESC to exit", (20, 40))
 
         pygame.display.flip()
 
 
-SIMULATION_MODE = "pygame"  # options: "text", "pygame", "both"
+SIMULATION_MODE = "manual-live"  # options: "text", "pygame", "both", "manual", "manual-pygame", "manual-live"
 SIMULATION_SEED = 7
 
 
 def main() -> None:
     mode = (SIMULATION_MODE or "text").strip().lower()
+    twin = DigitalTwin()
+
+    manual_live_modes = {"manual-live"}
+    if mode in manual_live_modes:
+        session = ManualSession(twin, seed=SIMULATION_SEED)
+        run = manual_pygame_loop(session)
+        print_timeline(run.events)
+        print_summary(run.vial)
+        return
+
+    manual_modes = {"manual", "manual-pygame", "manual-both"}
+    if mode in manual_modes:
+        session = ManualSession(twin, seed=SIMULATION_SEED)
+        run = manual_text_loop(session)
+        print_timeline(run.events)
+        print_summary(run.vial)
+        if mode in {"manual-pygame", "manual-both"}:
+            print("\n[info] Launching PyGame visualizer (close the window to finish)...")
+            visualize_with_pygame(
+                run.events,
+                run.initial_reservoirs,
+                run.vial.capacity_mL,
+                run.pipette_start_pos,
+            )
+        return
+
     if mode not in {"text", "pygame", "both"}:
         print(f"[info] Unknown SIMULATION_MODE '{SIMULATION_MODE}', defaulting to 'text'.")
         mode = "text"
 
-    twin = DigitalTwin()
     run = twin.run(recipe=demo_recipe(), seed=SIMULATION_SEED)
 
     if mode in ("text", "both"):
